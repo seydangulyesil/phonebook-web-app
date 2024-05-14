@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  CloudFormation Template for Phonebook Application. This template creates Application Load Balancer 
+  with Auto Scaling Group of Amazon Linux 2023  EC2 Instances which host Python Flask Web Application.
+  EC2 instances are placed within WebServerSecurityGroup which allows http (80) connections only from ALBSecurityGroup,
+  and allows tcp(3306) connections only within itself. RDS DB instance is placed within WebServerSecurityGroup 
+  so that Database Server can communicate with Web Servers. Application Load Balancer is placed within ALBSecurityGroup 
+  which allows http (80) and SSH (22)connections from anywhere. WebServerASG Auto Scaling Group is using the LT 
+  Launch Template in order to spin up instances needed. LT Launch Template is configured to prepare Python Flask 
+  environment on EC2, and to deploy Phonebook Application on Flask Server after downloading the app code 
+  from Github repository.
+Parameters:
+  myVPC:
+    Description: Select your VPC
+    Type: AWS::EC2::VPC::Id
+
+  myDbName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /clarusway/phonebook/dbname
+
+  # myDbUsername:
+  #   Type: AWS::SSM::Parameter::Value<String>
+  #   Default: /clarusway/phonebook/username
+
+  keyName:
+    Description: Please select your Key pair
+    Type: AWS::EC2::KeyPair::KeyName
+
+  latestAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64"
+
+  subnets:
+    Description: Select your subnets
+    Type: List<AWS::EC2::Subnet::Id>
+
+Resources:
+  autoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: 1
+      HealthCheckGracePeriod: 300
+      HealthCheckType: ELB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref launchTemplate
+        Version: !GetAtt launchTemplate.LatestVersionNumber
+      MaxSize: 3
+      MinSize: 1
+      TargetGroupARNs:
+        - !Ref targetGroup
+      VPCZoneIdentifier: !Ref subnets # not array
+
+  applicationLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions: # Required
+        - TargetGroupArn: !Ref targetGroup
+          Type: forward
+      LoadBalancerArn: !Ref applicationLoadBalancer # Required
+      Port: 80 # Required
+      Protocol: HTTP # Required
+
+  applicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      SecurityGroups:
+        - !GetAtt applicationLoadBalancerSecurityGroup.GroupId
+      Subnets: !Ref subnets
+      Type: application
+
+  launchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref latestAmiId
+        InstanceType: t2.micro
+        KeyName: !Ref keyName
+        IamInstanceProfile:
+          Name: !Ref myInstanceProfile
+        SecurityGroupIds:
+          - !GetAtt webServerSecurityGroup.GroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub Web Server of ${AWS::StackName} Stack
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #! /bin/bash -x
+              dnf update -y
+              dnf install python3 -y
+              dnf install python-pip -y
+              pip3 install Flask==2.3.3
+              pip3 install Flask-MySql
+              pip3 install boto3
+              dnf install git -y
+              echo "${MyDBURI}" > /home/ec2-user/dbserver.endpoint
+              cd /home/ec2-user
+              TOKEN=$(aws --region=us-east-1 ssm get-parameter --name /clarusway/phonebook/token --with-decryption --query 'Parameter.Value' --output text)
+              git clone https://$TOKEN@github.com/seydangulyesil/phonebook-web-app.git
+              python3 /home/ec2-user/phonebook-web-app/phonebook-app.py
+            - MyDBURI: !GetAtt dBInstance.Endpoint.Address
+
+  targetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 10
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref myVPC
+
+  myInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: SSMInstanceProfile
+      Roles:
+        - !Ref mySSMRole
+
+  mySSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SSMRoleWithManagedPolicyotto
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+
+  dBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 20
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: false
+      BackupRetentionPeriod: 0
+      DBInstanceClass: db.t3.micro
+      DBInstanceIdentifier: phonebook-app
+      DBName: !Ref myDbName # '{{resolve:ssm:/clarusway/phonebook/dbname:1}}'
+      DBSecurityGroups:
+        - !Ref dBSecurityGroup
+      Engine: mysql
+      EngineVersion: 8.0.35
+      MasterUserPassword: "{{resolve:ssm-secure:/clarusway/phonebook/password:1}}"
+      MasterUsername: "{{resolve:ssm:/clarusway/phonebook/username:1}}" # !Ref myDbUsername
+      Port: 3306
+      PubliclyAccessible: true
+
+  dBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      DBSecurityGroupIngress: # Required
+        - EC2SecurityGroupId: !GetAtt webServerSecurityGroup.GroupId
+      GroupDescription: DB SecGrp # Required
+      Tags:
+        - Key: Name
+          Value: seydan-phonebook-rds-secgrp
+
+  webServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web SecGrp # Required
+      GroupName: seydan-phonebook-web
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt applicationLoadBalancerSecurityGroup.GroupId
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # in some different case
+      VpcId: !Ref myVPC
+
+  applicationLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB SecGrp # Required
+      GroupName: seydan-phonebook-ALB
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref myVPC
+
+Outputs:
+  WebsiteURL:
+    Value: !Sub
+      - http://${ALBAddress}
+      - ALBAddress: !GetAtt applicationLoadBalancer.DNSName
+    Description: Phonebook Application Load Balancer URL
